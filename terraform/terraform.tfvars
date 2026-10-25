@@ -1,4 +1,4 @@
-aws_region          = "us-east-1"
+aws_region          = "us-west-2"
 service_name        = "product-service"
 ecr_repository_name = "product-service"
 desired_count       = 1
