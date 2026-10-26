@@ -29,3 +29,5 @@ target/
 *.iml
 .terraform/
 *.tfstate*
+# load test output
+latencies.csv
