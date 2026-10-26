@@ -1,6 +1,7 @@
-# sds-online-store
+# sds-load-tester
 
-A minimal product service on AWS ECS and a multithreaded Java load-testing client for it.
+A multithreaded Java load-testing client and the minimal product service on AWS ECS it runs against.
+One generator thread feeds a queue, N sender threads post 200,000 products, and the client measures throughput, latency percentiles and how close the scaling is to linear.
 
 **Group members:** Aleksei Anisimov
 
