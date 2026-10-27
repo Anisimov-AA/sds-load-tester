@@ -1,122 +1,146 @@
 # sds-load-tester
 
-A multithreaded Java load-testing client and the minimal product service on AWS ECS it runs against.
-One generator thread feeds a queue, N sender threads post 200,000 products, and the client measures throughput, latency percentiles and how close the scaling is to linear.
+A Java client that fires 200,000 requests at a small web service on AWS and measures how fast it answers.
 
-**Group members:** Aleksei Anisimov
+The service is a minimal Spring Boot app on ECS Fargate that accepts a product and replies `201 Created`. The client sends from many threads at once and reports throughput, latency percentiles, and how close the result is to linear scaling.
 
-## Structure
+<p align="center">
+  <img src="plot/throughput.png" width="760"/>
+</p>
 
-| Folder | What it is |
+## The big picture
+
+```
+                      queue (1,000)            32 sender threads
+generator thread  ──►  [ product, ... ]  ──►   POST /api/product  ──►  server on AWS ECS
+ (makes 200,000                                 (retry up to 5×)        (returns 201)
+  random products)
+```
+
+- **Generator**: one thread creates random products and puts them in a queue. When the queue is full, it waits.
+- **Senders**: N threads (32 by default). Each one takes a product from the queue, sends it, and takes the next. When the generator is done, it puts a "stop" marker in the queue for every sender.
+- **Server**: just receives the product and answers `201`, so the test measures the network and the threads, not business logic.
+
+## Results
+
+| Test | Throughput | Note |
+|---|---|---|
+| 1 thread, 10,000 requests | ~24.6 req/s | ~40 ms per request, mostly the network round trip |
+| 32 threads, 200,000 requests | ~768 req/s | linear would be 32 × 24.6 ≈ 787, so almost linear |
+
+The plot above is the 32-thread run: requests started in each second, steady around 750–800.
+
+## Three clients
+
+Each one builds on the previous one.
+
+| Folder | What it does |
 |---|---|
-| `server/` | Spring Boot service with `POST /api/product`. Accepts a product and returns `201 Created`. |
-| `terraform/` | ECR repository and ECS Fargate service (region `us-west-2`). |
-| `client-single/` | Single-thread test: 10,000 requests one after another, measures the latency of one request. |
-| `client1/` | Multithreaded client: 1 generator thread + N sender threads, 200,000 requests. |
-| `client2/` | Client 1 plus a latency record for every request, CSV output and statistics. |
-| `plot/` | Script that draws throughput over time from the Client 2 CSV. |
+| `client-single/` | One thread, 10,000 requests one after another. Measures how long a single request takes. |
+| `client1/` | Generator + N senders, 200,000 requests. Prints throughput and the "linear" expectation. |
+| `client2/` | Same as client 1, but also records every request. Writes `latencies.csv` and prints mean, median, p99, min and max latency. |
 
 ## Requirements
 
-Java 17+, Docker, AWS CLI with Learner Lab credentials, Terraform. Python with `matplotlib` for the plot.
-Maven is not needed: every Java project has its own `mvnw` wrapper.
+- **Java 17+**. Maven isn't needed: every Java folder has its own `mvnw`.
+- **Docker, AWS CLI, Terraform** to deploy the server, plus an AWS account
+- **Python with matplotlib** for the plot
 
-## Server
+## Run
 
-### Run locally
+### 1. Start the server
 
-```
+Locally:
+
+```powershell
 cd server
-./mvnw spring-boot:run
+.\mvnw spring-boot:run
 ```
 
-### Deploy to AWS
+Or on AWS. First connect the AWS CLI to your account (once) and check it works:
 
+```powershell
+aws configure
+aws sts get-caller-identity
 ```
+
+Then create the image repository, push the image, and create everything else:
+
+```powershell
+$registry = "$(aws sts get-caller-identity --query Account --output text).dkr.ecr.us-west-2.amazonaws.com"
+
 cd terraform
 terraform init
-terraform apply -target="aws_ecr_repository.app_repo"     # create the image repository first
+terraform apply -target="aws_ecr_repository.app_repo"
 
-cd ../server
+cd ..\server
 docker build -t product-service .
-aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin <account>.dkr.ecr.us-west-2.amazonaws.com
-docker tag product-service:latest <account>.dkr.ecr.us-west-2.amazonaws.com/product-service:latest
-docker push <account>.dkr.ecr.us-west-2.amazonaws.com/product-service:latest
+aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin $registry
+docker tag product-service:latest "$registry/product-service:latest"
+docker push "$registry/product-service:latest"
 
-cd ../terraform
+cd ..\terraform
 terraform apply
 ```
 
-### Find the IP and test
+Terraform uses `LabRole`, the role that AWS Learner Lab provides. In a normal account that role doesn't exist, so in `terraform/ecs.tf` replace it with your own role that has the `AmazonECSTaskExecutionRolePolicy`.
 
-The server's public IP: AWS console → ECS → Clusters → `product-service-cluster` → Tasks → the running task → Public IP.
+Get the server's IP from the AWS console: ECS → Clusters → `product-service-cluster` → Tasks → the running task → Public IP.
 
+Check it answers (expect `201`):
+
+```powershell
+Invoke-WebRequest -Method Post -Uri http://<server-ip>:8080/api/product -ContentType "application/json" -Body '{"product_id":42,"sku":"K7Q2M9X1BZ","manufacturer":"Acme Tools","category_id":812,"weight":2350,"some_other_id":9001}'
 ```
-curl -i -X POST http://<server-ip>:8080/api/product \
-  -H "Content-Type: application/json" \
-  -d '{"product_id":42,"sku":"K7Q2M9X1BZ","manufacturer":"Acme Tools","category_id":812,"weight":2350,"some_other_id":9001}'
+
+### 2. Run a client
+
+The first argument is the server address. For client 1 and 2, the second is the number of sender threads.
+
+```powershell
+cd client-single
+.\mvnw compile exec:java "-Dexec.args=http://<server-ip>:8080"
 ```
 
-Expected: `201 Created` and `{"product_id":42}`.
-
-### Pause and start again
-
-Stop the running server between sessions but keep everything else (cluster, image, settings).
-Ending the Learner Lab does **not** stop a server that is already running.
-
+```powershell
+cd client2
+.\mvnw compile exec:java "-Dexec.args=http://<server-ip>:8080 32"
 ```
+
+### 3. Draw the plot
+
+```powershell
+cd plot
+pip install matplotlib
+python plot.py ..\client2\latencies.csv
+```
+
+This saves `throughput.png`.
+
+## AWS housekeeping
+
+A running server costs money (Fargate Spot, 0.25 vCPU, about a cent an hour), and ending a Learner Lab session doesn't stop it. Pause it when you're not testing:
+
+```powershell
 aws ecs update-service --cluster product-service-cluster --service product-service --desired-count 0 --region us-west-2
 ```
 
-Start it again (with fresh Learner Lab credentials):
+Start it again with `--desired-count 1`. A new task gets a new IP, so look it up again in the console.
 
-```
-aws ecs update-service --cluster product-service-cluster --service product-service --desired-count 1 --region us-west-2
-```
+Delete everything (image repository, cluster, service, security group, logs):
 
-Each new task gets a new public IP: take it from the console after the task is Running.
-
-### Delete everything from AWS
-
-Removes the ECR repository with the image, the cluster, the service, the security group and the logs.
-
-```
+```powershell
 cd terraform
 terraform destroy
 ```
 
-Type `yes` when asked. Expected: `Destroy complete! Resources: 6 destroyed.`
-
-## Clients
-
-All clients take the server address as the first argument (default `http://localhost:8080`).
-Client 1 and Client 2 take the number of sender threads as the second argument (default `32`).
+## Code
 
 ```
-cd client-single
-./mvnw compile exec:java "-Dexec.args=http://<server-ip>:8080"
-
-cd client1
-./mvnw compile exec:java "-Dexec.args=http://<server-ip>:8080 32"
-
-cd client2
-./mvnw compile exec:java "-Dexec.args=http://<server-ip>:8080 32"
+server/          Spring Boot service, POST /api/product, Dockerfile
+terraform/       ECR repository + ECS Fargate service in us-west-2 (0.25 vCPU, 512 MB)
+client-single/   SingleThreadClient
+client1/         MultiThreadClient, ProductProducer (generator), PostWorker (sender)
+client2/         same as client1 + LatencyRecord and CSV/statistics
+plot/            plot.py and the saved throughput.png
 ```
-
-On Windows use `.\mvnw` instead of `./mvnw`.
-
-Client 2 writes `latencies.csv` (`start_ms,request_type,latency_ms,status_code`) to its folder and prints mean, median, p99, min and max latency.
-
-## Plot
-
-```
-cd plot
-pip install matplotlib
-python plot.py ../client2/latencies.csv
-```
-
-Saves `throughput.png`: requests started in each second of the run.
-
-Result for Client 2 with 32 threads (200,000 requests, about 768 req/s):
-
-![Throughput over time](plot/throughput.png)
